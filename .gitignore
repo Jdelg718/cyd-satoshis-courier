@@ -1,0 +1,22 @@
+# PlatformIO build output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Generated sdkconfig - regenerated from sdkconfig.defaults on every build.
+# Committing it causes spurious diffs and stale settings.
+sdkconfig.*
+!sdkconfig.defaults
+
+# Raw phone photos / video of the dev board (downscaled copies live in docs/)
+IMG_*.jpeg
+IMG_*.JPEG
+IMG_*.jpg
+IMG_*.MOV
+IMG_*.mov
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

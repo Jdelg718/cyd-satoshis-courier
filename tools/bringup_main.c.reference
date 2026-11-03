@@ -1,0 +1,238 @@
+// Satoshi's Courier - HARDWARE BRING-UP
+// Validates every peripheral and resolves the two open questions before the
+// game is built on top: (1) which I2S pin is really DOUT, (2) SD + speaker.
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include "board.h"
+#include "display.h"
+#include "touch.h"
+#include "audio.h"
+#include "storage.h"
+#include "rgbled.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_chip_info.h"
+#include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "bringup";
+
+typedef struct { const char *name; bool ok; char detail[48]; } result_t;
+static result_t results[10];
+static int n_results = 0;
+
+static void record(const char *name, bool ok, const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    results[n_results].name = name;
+    results[n_results].ok = ok;
+    vsnprintf(results[n_results].detail, sizeof(results[n_results].detail), fmt, ap);
+    va_end(ap);
+    ESP_LOGI(TAG, "[%s] %-10s %s", ok ? "PASS" : "FAIL", name, results[n_results].detail);
+    n_results++;
+}
+
+static void draw_report(int highlight)
+{
+    disp_clear(C_BLACK);
+    disp_fill_rect(0, 0, LCD_W, 26, C_ORANGE);
+    disp_text(8, 10, "BRING-UP REPORT", C_BLACK, 1);
+
+    int y = 38;
+    for (int i = 0; i < n_results; i++) {
+        uint16_t c = results[i].ok ? C_GREEN : C_RED;
+        if (i == highlight) disp_fill_rect(0, y - 3, LCD_W, 22, RGB(28, 28, 40));
+        disp_text(8, y, results[i].ok ? "OK " : "XX ", c, 1);
+        disp_text(30, y, results[i].name, C_WHITE, 1);
+        disp_text(8, y + 9, results[i].detail, C_DIM, 1);
+        y += 24;
+    }
+    disp_flush();
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "=== Satoshi's Courier :: hardware bring-up ===");
+
+    // ---- 1. Chip + memory ----
+    esp_chip_info_t ci; esp_chip_info(&ci);
+    size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t dram  = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "ESP32-S3 rev v%d.%d, %d cores, PSRAM %u KB, DRAM %u KB",
+             ci.revision / 100, ci.revision % 100, ci.cores,
+             (unsigned)(psram / 1024), (unsigned)(dram / 1024));
+
+    board_init();
+    rgbled_init();
+    rgbled_set(40, 20, 0);
+
+    record("PSRAM", psram > 4 * 1024 * 1024, "%u KB octal", (unsigned)(psram / 1024));
+
+    // ---- 2. Display ----
+    int64_t t0 = esp_timer_get_time();
+    disp_init();
+    record("ILI9341", true, "240x320 init %" PRId64 " ms", (esp_timer_get_time() - t0) / 1000);
+
+    // Colour-bar + gradient test so panel polarity/orientation is visible.
+    disp_clear(C_BLACK);
+    const uint16_t bars[] = { C_RED, C_GREEN, C_CYAN, C_YELLOW, C_ORANGE, C_WHITE };
+    for (int i = 0; i < 6; i++) disp_fill_rect(i * 40, 0, 40, 90, bars[i]);
+    for (int x = 0; x < LCD_W; x++) {
+        uint8_t v = (uint8_t)(x * 255 / (LCD_W - 1));
+        disp_fill_rect(x, 90, 1, 40, RGB(v, v, v));
+    }
+    disp_text_center(150, "SATOSHIS COURIER", C_ORANGE, 2);
+    disp_text_center(175, "hardware bring-up", C_DIM, 1);
+    disp_text(8, 200, "Top-left should be RED.", C_WHITE, 1);
+    disp_text(8, 212, "Gradient: black -> white.", C_WHITE, 1);
+    disp_flush();
+
+    // ---- 3. Frame rate: full-screen DMA flush from PSRAM ----
+    t0 = esp_timer_get_time();
+    for (int i = 0; i < 30; i++) { disp_clear(i & 1 ? C_BLACK : RGB(10, 10, 20)); disp_flush(); }
+    int64_t us = (esp_timer_get_time() - t0) / 30;
+    record("FPS", us < 40000, "%" PRId64 " us/frame = %" PRId64 " fps", us, 1000000 / us);
+
+    // ---- 4. Touch ----
+    touch_init();
+    uint8_t vid = touch_probe_id();
+    record("FT6336G", vid != 0, vid ? "vendor id 0x%02X" : "no I2C response", vid);
+
+    // ---- 5. SD card ----
+    bool sd = sd_mount();
+    record("microSD", sd, sd ? "%s %lluMB 4-bit" : "not mounted", sd_name(), sd_capacity_mb());
+
+    // ---- 6. Battery ----
+    float vb = board_battery_volts();
+    record("BAT ADC", vb >= 0, "%.2f V (raw IO9)", vb);
+
+    // ---- 7. Entropy taps: floating header pins must actually jitter ----
+    int lo = 9999, hi = -1;
+    for (int i = 0; i < 64; i++) {
+        int v = board_adc_raw(ADC_CHANNEL_1);
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    record("IO2 noise", hi > lo, "spread %d LSB (%d..%d)", hi - lo, lo, hi);
+
+    draw_report(-1);
+    vTaskDelay(pdMS_TO_TICKS(2500));
+
+    // ---- 8. Audio: let the board resolve its own DOUT/DIN pinout ----
+    // Play a 1 kHz tone and listen for it on the onboard MEMS mic. Only the
+    // correct pin pairing closes the acoustic loop, so the winner is measured,
+    // not guessed. Goertzel keeps a floating input pin from faking a pass.
+    const int candidates[2][2] = { {6, 8}, {8, 6} };   // {dout, din}
+    float ratio[2] = { -1.0f, -1.0f };
+    int best = -1;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int dout = candidates[attempt][0], din = candidates[attempt][1];
+
+        disp_clear(C_BLACK);
+        disp_text_center(80, "AUDIO SELF-TEST", C_ORANGE, 2);
+        char line[40];
+        snprintf(line, sizeof(line), "DOUT=IO%d  DIN=IO%d", dout, din);
+        disp_text_center(120, line, C_WHITE, 1);
+        disp_text_center(150, "playing 1 kHz", C_CYAN, 1);
+        disp_text_center(166, "listening on mic", C_CYAN, 1);
+        disp_flush();
+        rgbled_set(0, 0, 60);
+
+        ESP_LOGW(TAG, ">>> loopback probe %d: DOUT=IO%d DIN=IO%d", attempt + 1, dout, din);
+        if (audio_init(touch_i2c_bus(), dout, din)) {
+            audio_volume(90);
+            ratio[attempt] = audio_loopback_probe(1000.0f, 700);
+            ESP_LOGW(TAG, "    tone/silence ratio = %.1fx", ratio[attempt]);
+        } else {
+            ESP_LOGE(TAG, "    codec init failed");
+        }
+        audio_deinit();
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    best = (ratio[0] >= ratio[1]) ? 0 : 1;
+    bool conclusive = ratio[best] > 4.0f && ratio[best] > 2.0f * ratio[1 - best];
+    ESP_LOGW(TAG, "=== AUDIO PINOUT: DOUT=IO%d DIN=IO%d  (%.1fx vs %.1fx) %s ===",
+             candidates[best][0], candidates[best][1], ratio[best], ratio[1 - best],
+             conclusive ? "CONCLUSIVE" : "INCONCLUSIVE - check speaker is plugged in");
+    record("I2S pinout", conclusive, "DOUT=IO%d (%.0fx vs %.0fx)",
+           candidates[best][0], ratio[best], ratio[1 - best]);
+
+    // Re-open on the winning pinout and play a confirmation fanfare.
+    disp_clear(C_BLACK);
+    disp_text_center(100, "RESULT", C_DIM, 1);
+    {
+        char line[40];
+        snprintf(line, sizeof(line), "DOUT = IO%d", candidates[best][0]);
+        disp_text_center(125, line, conclusive ? C_GREEN : C_RED, 2);
+        snprintf(line, sizeof(line), "%.0fx vs %.0fx", ratio[best], ratio[1 - best]);
+        disp_text_center(165, line, C_WHITE, 1);
+    }
+    disp_flush();
+    if (audio_init(touch_i2c_bus(), candidates[best][0], candidates[best][1])) {
+        audio_volume(85);
+        audio_tone(523.25f, 150, 0.7f);
+        audio_tone(659.25f, 150, 0.7f);
+        audio_tone(783.99f, 150, 0.7f);
+        audio_tone(1046.50f, 420, 0.7f);
+        audio_amp(false);
+    }
+    audio_deinit();
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    // ---- 9. RGB LED sweep ----
+    for (int i = 0; i < 256; i += 4) rgbled_set(255 - i, i, (i * 2) & 0xFF);
+    rgbled_set(0, 40, 0);
+    record("RGB LED", true, "WS2812B on IO42 swept");
+
+    // ---- 9b. Touch mapping check: is raw == screen space, unmirrored? ----
+    const int tx[4] = { 24, LCD_W - 24, 24, LCD_W - 24 };
+    const int ty[4] = { 44, 44, LCD_H - 44, LCD_H - 44 };
+    const char *tn[4] = { "TOP-LEFT", "TOP-RIGHT", "BOTTOM-LEFT", "BOTTOM-RIGHT" };
+    for (int i = 0; i < 4; i++) {
+        disp_clear(C_BLACK);
+        disp_text_center(120, "TAP THE DOT", C_WHITE, 2);
+        disp_text_center(150, tn[i], C_ORANGE, 1);
+        disp_fill_circle(tx[i], ty[i], 14, C_ORANGE);
+        disp_circle(tx[i], ty[i], 20, C_WHITE);
+        disp_flush();
+        rgbled_set(60, 30, 0);
+        touch_pt_t p;
+        while (!(touch_read(&p) && p.pressed)) vTaskDelay(pdMS_TO_TICKS(10));
+        int dx = p.x - tx[i], dy = p.y - ty[i];
+        bool near = (dx > -40 && dx < 40 && dy > -40 && dy < 40);
+        ESP_LOGW(TAG, "TOUCH MAP %-13s target=(%3d,%3d) raw=(%3d,%3d) delta=(%+4d,%+4d) %s",
+                 tn[i], tx[i], ty[i], p.x, p.y, dx, dy, near ? "<-- MATCH" : "<-- MISMATCH");
+        rgbled_set(near ? 0 : 60, near ? 60 : 0, 0);
+        while (touch_read(&p) && p.pressed) vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    // ---- 10. Final report + live touch readout ----
+    draw_report(-1);
+    ESP_LOGI(TAG, "=== bring-up complete: touch the screen to see coordinates ===");
+
+    touch_pt_t pt;
+    int last_x = -1, last_y = -1;
+    while (1) {
+        if (touch_read(&pt) && pt.pressed) {
+            if (pt.x != last_x || pt.y != last_y) {
+                ESP_LOGI(TAG, "touch raw x=%d y=%d", pt.x, pt.y);
+                last_x = pt.x; last_y = pt.y;
+            }
+            disp_fill_circle(pt.x, pt.y, 6, C_ORANGE);
+            char buf[32];
+            disp_fill_rect(0, LCD_H - 14, LCD_W, 14, C_BLACK);
+            snprintf(buf, sizeof(buf), "touch %3d,%3d", pt.x, pt.y);
+            disp_text(8, LCD_H - 11, buf, C_CYAN, 1);
+            disp_flush();
+            rgbled_set(60, 30, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(16));
+    }
+}
